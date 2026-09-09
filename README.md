@@ -93,19 +93,82 @@ After confirmation, `goup` runs `go get` for each selected dependency and then r
 
 Press `/` on the dependency list to filter by module path. Matching is case-insensitive substring matching against module paths and updates live as you type — entirely in memory, with no network or re-discovery.
 
+### Example session
+
+Start with the full update list:
+
+```text
+  8 updates available
+
+  ◯ github.com/gin-gonic/gin     v1.9.1  → v1.10.0   direct    ✓
+  ◯ github.com/google/uuid       v1.6.0  → v1.7.0    direct    ✓
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH
+  ◯ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
+
+  ↑/↓ Navigate  Space Select  / Search  d Details  Enter Upgrade  q Quit
+```
+
+Press `/` and type `golang.org/x` — the list narrows on every keystroke:
+
 ```text
 Search: golang.org/x█
 
-  ◯ golang.org/x/net     v0.24.0 → v0.30.0   direct   ✓
-  ◯ golang.org/x/sync    v0.6.0  → v0.8.0    direct   ✓
-  ◯ golang.org/x/text    v0.9.0  → v0.10.0   direct   ✓
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH  ✓ fixed by upgrade
+  ◯ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
 
-  3 of 27 dependencies match
+  3 of 8 dependencies match
+
+  Type Search  ↑/↓ Navigate  Space Select  Enter Apply  Esc Clear
 ```
 
-While the search input has focus, every printable key (including `q`, `a`, `n`) types into the query. `↑`/`↓` navigate the filtered results, `Space` selects, `Enter` exits search keeping the filter applied, and `Esc` clears the search and restores the full list. Matched rows keep their security badges and direct/indirect labels; matches whose path starts with the query rank slightly higher.
+Search finds what you meant without the full path — `redis` matches
+`github.com/redis/go-redis/v9`, `x/sync` matches `golang.org/x/sync`,
+and `GOLANG.ORG/X` matches all three `golang.org/x/*` modules. Paths
+whose segment starts with the query rank first:
 
-Search composes with everything else: it filters the same list produced by `--indirect` and `--security`, and selections belong to the dependency — not to its position in the filtered list — so they survive any round of filtering and clearing.
+```text
+Search: redis█
+
+  ◯ github.com/redis/go-redis/v9   v9.5.1 → v9.7.0   indirect   ✓
+  ◯ github.com/foo/redis-wrapper   v1.0.2 → v1.1.0   direct     ✓
+
+  2 of 8 dependencies match
+```
+
+Press `Enter` to keep the filter applied while you work, or `Esc` to
+clear it and restore the full list:
+
+```text
+  Search cleared.
+
+  8 updates available
+
+  ◯ github.com/gin-gonic/gin     v1.9.1  → v1.10.0   direct    ✓
+  ...
+```
+
+### Search + security + selection
+
+Security badges and direct/indirect labels stay on filtered rows, and
+selections belong to the dependency — not to its position — so they
+survive filtering. Select while filtered, clear, and everything you
+ticked is still ticked:
+
+```text
+Search: golang.org/x█
+
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH
+  ◉ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
+
+  3 of 8 dependencies match
+  ● 1 selected
+```
+
+With `--security`, search narrows the already-filtered vulnerable list;
+with `--indirect`, both direct and indirect matches appear.
 
 ## Security check
 
