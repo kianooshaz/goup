@@ -41,7 +41,7 @@ func TestParseGoListOutput(t *testing.T) {
 					Version:  "v1.0.0",
 					Indirect: false,
 					Main:     false,
-					Update:   &struct {
+					Update: &struct {
 						Path    string `json:"path"`
 						Version string `json:"version"`
 					}{Path: "github.com/foo/bar", Version: "v1.2.0"},

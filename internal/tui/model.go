@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -11,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kianooshaz/goup/internal/module"
+	"github.com/kianooshaz/goup/internal/security"
 	"github.com/kianooshaz/goup/internal/updater"
 )
 
@@ -20,25 +22,48 @@ type screen int
 const (
 	screenLoading screen = iota
 	screenList
+	screenDetail
 	screenConfirm
 	screenUpgrading
 	screenDone
 	screenError
 )
 
+// SecurityMode determines how security data appears in the list.
+type SecurityMode int
+
+const (
+	// SecurityOn shows badges, summary, and security-first sorting.
+	SecurityOn SecurityMode = iota
+	// SecurityOnly filters the list to vulnerable dependencies.
+	SecurityOnly
+	// SecurityOff hides all security columns and sorting.
+	SecurityOff
+)
+
 // Model is the main Bubble Tea model for the goup TUI.
 type Model struct {
 	// Dependencies data.
 	deps []module.Dependency
-	// Selected tracks which dependencies are selected (by index).
+	// Selected tracks which dependencies are selected (by index into deps).
 	selected map[int]bool
 
+	// Security data. security aligns by index with deps; visible holds the
+	// indices of deps shown on the list screen (all of them, or only
+	// vulnerable ones in security-only mode).
+	security []security.DependencyStatus
+	visible  []int
+	secMode  SecurityMode
+
+	// Detail view state: index into security/deps shown on screenDetail.
+	detailIndex int
+
 	// UI state.
-	screen    screen
-	cursor    int
-	topIndex  int // first visible item in the viewport
-	width     int
-	height    int
+	screen   screen
+	cursor   int
+	topIndex int // first visible item in the viewport
+	width    int
+	height   int
 
 	// Loading/error state.
 	loadingErr error
@@ -69,7 +94,9 @@ type Model struct {
 }
 
 // NewModel creates a new TUI model with the given dependencies and updater.
-func NewModel(deps []module.Dependency, u *updater.Updater) *Model {
+// security aligns by index with deps and may be nil when security checking
+// is disabled.
+func NewModel(deps []module.Dependency, sec []security.DependencyStatus, mode SecurityMode, u *updater.Updater) *Model {
 	s := spinner.New()
 	s.Spinner = spinner.Line
 	s.Style = infoStyle
@@ -77,16 +104,71 @@ func NewModel(deps []module.Dependency, u *updater.Updater) *Model {
 	vp := viewport.New(80, 20)
 	vp.Style = lipgloss.NewStyle().Padding(0, 1)
 
-	return &Model{
-		deps:      deps,
-		selected:  make(map[int]bool),
-		screen:    screenList,
-		cursor:    0,
-		topIndex:  0,
-		spinner:   s,
-		viewport:  vp,
-		updater:   u,
+	m := &Model{
+		deps:     deps,
+		selected: make(map[int]bool),
+		security: sec,
+		secMode:  mode,
+		screen:   screenList,
+		cursor:   0,
+		topIndex: 0,
+		spinner:  s,
+		viewport: vp,
+		updater:  u,
 	}
+	m.rebuildVisible()
+	return m
+}
+
+// rebuildVisible recomputes which dependency indices the list shows. In
+// security-only mode only dependencies with confirmed vulnerabilities are
+// listed; otherwise all are. With security enabled the most urgent items
+// (highest severity first, then failed checks) sort to the top so they
+// cannot hide below the fold; the rest keep the discovery order. The
+// cursor is clamped to the new range.
+func (m *Model) rebuildVisible() {
+	m.visible = m.visible[:0]
+	for i := range m.deps {
+		if m.secMode == SecurityOnly {
+			if !m.security[i].Status.CheckedOK() || len(m.security[i].Status.Vulnerabilities) == 0 {
+				continue
+			}
+		}
+		m.visible = append(m.visible, i)
+	}
+	if m.secMode != SecurityOff {
+		sort.SliceStable(m.visible, func(a, b int) bool {
+			return secUrgency(m.security[m.visible[a]]) > secUrgency(m.security[m.visible[b]])
+		})
+	}
+	if m.cursor >= len(m.visible) {
+		m.cursor = max(len(m.visible)-1, 0)
+	}
+	if m.topIndex > m.cursor {
+		m.topIndex = m.cursor
+	}
+}
+
+// secUrgency ranks a dependency for list ordering: vulnerable deps by
+// severity, failed checks above clean deps, clean deps last.
+func secUrgency(item security.DependencyStatus) int {
+	switch {
+	case item.Status.CheckedOK() && len(item.Status.Vulnerabilities) > 0:
+		return 10 + item.Status.Severity.Rank()
+	case !item.Status.CheckedOK():
+		return 5
+	default:
+		return 0
+	}
+}
+
+// securityFor returns the security status for a deps index, or a
+// disabled/unchecked status when security data is absent.
+func (m *Model) securityFor(i int) security.DependencyStatus {
+	if i < 0 || i >= len(m.security) {
+		return security.DependencyStatus{}
+	}
+	return m.security[i]
 }
 
 // Init initializes the model.
@@ -157,12 +239,24 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case screenList:
 		return m.handleListKey(msg)
+	case screenDetail:
+		return m.handleDetailKey(msg)
 	case screenConfirm:
 		return m.handleConfirmKey(msg)
 	case screenDone, screenError:
 		return m.handleDoneKey(msg)
 	case screenUpgrading:
 		// During upgrade, only allow quitting on completion.
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleDetailKey processes input on the security detail screen.
+func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc", "d", "enter", "ctrl+c":
+		m.screen = screenList
 		return m, nil
 	}
 	return m, nil
@@ -181,7 +275,7 @@ func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "down", "j":
-		if m.cursor < len(m.deps)-1 {
+		if m.cursor < len(m.visible)-1 {
 			m.cursor++
 			m.ensureCursorVisible()
 		}
@@ -194,6 +288,12 @@ func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n":
 		m.selectNone()
+
+	case "d":
+		if len(m.visible) > 0 {
+			m.detailIndex = m.visible[m.cursor]
+			m.screen = screenDetail
+		}
 
 	case "enter":
 		return m.handleEnter()
@@ -252,19 +352,23 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// toggleSelection toggles the selection state of the dependency at index i.
+// toggleSelection toggles the selection state of the visible row at index i.
 func (m *Model) toggleSelection(i int) {
-	if m.selected[i] {
-		delete(m.selected, i)
+	if i < 0 || i >= len(m.visible) {
+		return
+	}
+	depIdx := m.visible[i]
+	if m.selected[depIdx] {
+		delete(m.selected, depIdx)
 	} else {
-		m.selected[i] = true
+		m.selected[depIdx] = true
 	}
 }
 
 // selectAll selects all currently displayed dependencies.
 func (m *Model) selectAll() {
-	for i := range m.deps {
-		m.selected[i] = true
+	for _, depIdx := range m.visible {
+		m.selected[depIdx] = true
 	}
 }
 
@@ -378,14 +482,25 @@ func (m *Model) listView() string {
 	b.WriteString(titleStyle.Render("\n  goup — Go dependency updater"))
 	b.WriteString("\n\n")
 
-	// Subtitle.
-	updatesCount := len(m.deps)
+	// Subtitle and security summary.
+	updatesCount := len(m.visible)
 	b.WriteString(subtitleStyle.Render(fmt.Sprintf("  %d updates available", updatesCount)))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	if m.secMode != SecurityOff {
+		if summary := Summarize(m.security); summary.HasIssues() {
+			b.WriteString("  " + summary.Render() + "\n")
+		}
+	} else if m.secMode == SecurityOff {
+		b.WriteString(dimmedStyle.Render("  security check disabled (--no-security)") + "\n")
+	}
+	b.WriteString("\n")
 
 	// Column headers.
 	columns := fmt.Sprintf("  %-45s %-12s %-12s %s",
 		"Dependency", "Current", "Latest", "Type")
+	if m.secMode != SecurityOff {
+		columns += "  Security"
+	}
 	b.WriteString(dimmedStyle.Render(columns))
 	b.WriteString("\n")
 	b.WriteString(dimmedStyle.Render(strings.Repeat("─", max(m.width-4, 50))))
@@ -397,16 +512,17 @@ func (m *Model) listView() string {
 		visibleHeight = 10
 	}
 	end := m.topIndex + visibleHeight
-	if end > len(m.deps) {
-		end = len(m.deps)
+	if end > len(m.visible) {
+		end = len(m.visible)
 	}
 
-	for i := m.topIndex; i < end; i++ {
-		dep := m.deps[i]
-		selected := m.selected[i]
-		isCursor := i == m.cursor
+	for row := m.topIndex; row < end; row++ {
+		depIdx := m.visible[row]
+		dep := m.deps[depIdx]
+		selected := m.selected[depIdx]
+		isCursor := row == m.cursor
 
-		b.WriteString(m.renderItem(dep, selected, isCursor))
+		b.WriteString(m.renderItem(depIdx, dep, selected, isCursor))
 		b.WriteString("\n")
 	}
 
@@ -415,7 +531,11 @@ func (m *Model) listView() string {
 
 	// Selection count.
 	selectedCount := len(m.selectedIndices())
-	if selectedCount > 0 {
+	if m.secMode == SecurityOnly && selectedCount > 0 {
+		b.WriteString(fmt.Sprintf("  %s %d selected  %s\n",
+			infoStyle.Render("●"), selectedCount,
+			dimmedStyle.Render("1 security issue requires attention")))
+	} else if selectedCount > 0 {
 		b.WriteString(fmt.Sprintf("  %s %d selected\n", infoStyle.Render("●"), selectedCount))
 	} else {
 		b.WriteString(fmt.Sprintf("  %s no dependencies selected\n", dimmedStyle.Render("○")))
@@ -425,16 +545,16 @@ func (m *Model) listView() string {
 	b.WriteString("\n")
 	b.WriteString(m.renderHelp())
 
-	if m.topIndex > 0 || end < len(m.deps) {
+	if m.topIndex > 0 || end < len(m.visible) {
 		b.WriteString(fmt.Sprintf("\n  %s", dimmedStyle.Render(fmt.Sprintf(
-			"Showing %d-%d of %d", m.topIndex+1, end, len(m.deps)))))
+			"Showing %d-%d of %d", m.topIndex+1, end, len(m.visible)))))
 	}
 
 	return appStyle.Render(b.String())
 }
 
 // renderItem renders a single dependency line.
-func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) string {
+func (m *Model) renderItem(depIdx int, dep module.Dependency, selected bool, isCursor bool) string {
 	// Checkbox.
 	checkbox := checkboxEmpty
 	if selected {
@@ -449,18 +569,25 @@ func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) 
 		depTypeStyle = mutedStyle
 	}
 
-	// Version info.
-	currentVer := dep.CurrentVersion
-	latestVer := dep.LatestVersion
+	// Security column.
+	secCol := ""
+	if m.secMode != SecurityOff {
+		item := m.securityFor(depIdx)
+		secCol = "  " + securityColumn(item)
+		if note := fixNote(item); note != "" {
+			secCol += "  " + note
+		}
+	}
 
 	// Build the line.
-	line := fmt.Sprintf("  %s %-42s %-12s %s %-12s %s",
+	line := fmt.Sprintf("  %s %-42s %-12s %s %-12s %s%s",
 		checkbox,
 		dep.Path,
-		currentVer,
+		dep.CurrentVersion,
 		versionArrow,
-		latestVer,
+		dep.LatestVersion,
 		depTypeStyle.Render(depType),
+		secCol,
 	)
 
 	style := itemStyle
@@ -475,10 +602,20 @@ func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) 
 	return style.Render(line)
 }
 
-// renderHelp shows the keyboard shortcuts.
+// renderHelp shows the keyboard shortcuts. Security-related bindings are
+// hidden when the security feature is disabled.
 func (m *Model) renderHelp() string {
 	k := keyMap{}
 	bindings := k.help()
+	if m.secMode == SecurityOff {
+		filtered := bindings[:0]
+		for _, b := range bindings {
+			if b.key != "d" {
+				filtered = append(filtered, b)
+			}
+		}
+		bindings = filtered
+	}
 	var parts []string
 	for _, b := range bindings {
 		parts = append(parts, fmt.Sprintf("%s %s",

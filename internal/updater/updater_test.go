@@ -40,7 +40,7 @@ func TestUpgrade_Success(t *testing.T) {
 		stub: map[string]fakeResult{
 			"go -C /test get github.com/foo/bar@v2.0.0": {output: []byte(""), err: nil},
 			"go -C /test get github.com/foo/baz@v1.1.0": {output: []byte(""), err: nil},
-			"go -C /test mod tidy":                       {output: []byte(""), err: nil},
+			"go -C /test mod tidy":                      {output: []byte(""), err: nil},
 		},
 	}
 
@@ -97,7 +97,7 @@ func TestUpgrade_PartialFailure(t *testing.T) {
 		stub: map[string]fakeResult{
 			"go -C /test get github.com/foo/bar@v2.0.0": {output: []byte(""), err: nil},
 			"go -C /test get github.com/foo/baz@v9.9.9": {output: nil, err: errors.New("not found")},
-			"go -C /test mod tidy":                       {output: []byte(""), err: nil},
+			"go -C /test mod tidy":                      {output: []byte(""), err: nil},
 		},
 	}
 

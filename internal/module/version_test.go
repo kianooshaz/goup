@@ -65,10 +65,10 @@ func TestClassifyUpdate(t *testing.T) {
 
 func TestParseVersionParts(t *testing.T) {
 	tests := []struct {
-		version    string
-		wantMajor  int
-		wantMinor  int
-		wantPatch  int
+		version   string
+		wantMajor int
+		wantMinor int
+		wantPatch int
 	}{
 		{"v1.2.3", 1, 2, 3},
 		{"v10.20.30", 10, 20, 30},
