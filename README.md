@@ -81,12 +81,31 @@ The selected directory must contain a `go.mod` file. If no updates are available
 | `Space` | Toggle the current dependency |
 | `a` | Select all dependencies |
 | `n` | Select no dependencies |
+| `/` | Search dependencies by module path |
 | `d` | Show security details for the current dependency |
 | `Enter` | Continue to review or start upgrades |
-| `q` / `Esc` | Quit, or return from the detail view |
+| `q` / `Esc` | Quit, clear search, or return from the detail view |
 | `Ctrl+C` | Quit |
 
 After confirmation, `goup` runs `go get` for each selected dependency and then runs `go mod tidy`. Upgrade failures are reported individually while processing continues for the remaining selections.
+
+## Search
+
+Press `/` on the dependency list to filter by module path. Matching is case-insensitive substring matching against module paths and updates live as you type — entirely in memory, with no network or re-discovery.
+
+```text
+Search: golang.org/x█
+
+  ◯ golang.org/x/net     v0.24.0 → v0.30.0   direct   ✓
+  ◯ golang.org/x/sync    v0.6.0  → v0.8.0    direct   ✓
+  ◯ golang.org/x/text    v0.9.0  → v0.10.0   direct   ✓
+
+  3 of 27 dependencies match
+```
+
+While the search input has focus, every printable key (including `q`, `a`, `n`) types into the query. `↑`/`↓` navigate the filtered results, `Space` selects, `Enter` exits search keeping the filter applied, and `Esc` clears the search and restores the full list. Matched rows keep their security badges and direct/indirect labels; matches whose path starts with the query rank slightly higher.
+
+Search composes with everything else: it filters the same list produced by `--indirect` and `--security`, and selections belong to the dependency — not to its position in the filtered list — so they survive any round of filtering and clearing.
 
 ## Security check
 

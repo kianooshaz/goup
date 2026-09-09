@@ -55,6 +55,12 @@ type Model struct {
 	visible  []int
 	secMode  SecurityMode
 
+	// Search state: query filters visible by module path, searching is
+	// true while the search input has focus. Selections are keyed by
+	// dependency index and are unaffected by filtering.
+	query     string
+	searching bool
+
 	// Detail view state: index into security/deps shown on screenDetail.
 	detailIndex int
 
@@ -120,27 +126,51 @@ func NewModel(deps []module.Dependency, sec []security.DependencyStatus, mode Se
 	return m
 }
 
-// rebuildVisible recomputes which dependency indices the list shows. In
-// security-only mode only dependencies with confirmed vulnerabilities are
-// listed; otherwise all are. With security enabled the most urgent items
-// (highest severity first, then failed checks) sort to the top so they
-// cannot hide below the fold; the rest keep the discovery order. The
-// cursor is clamped to the new range.
+// rebuildVisible recomputes which dependency indices the list shows,
+// applying the filter pipeline in order:
+//
+//	all deps → security-only filter → search filter →
+//	security-urgency sort → search prefix rank
+//
+// Every stage is stable, so the discovery order survives where no stage
+// has an opinion. The cursor is clamped to the new range.
 func (m *Model) rebuildVisible() {
 	m.visible = m.visible[:0]
-	for i := range m.deps {
-		if m.secMode == SecurityOnly {
+	if m.secMode == SecurityOnly {
+		for i := range m.deps {
 			if !m.security[i].Status.CheckedOK() || len(m.security[i].Status.Vulnerabilities) == 0 {
 				continue
 			}
+			m.visible = append(m.visible, i)
 		}
-		m.visible = append(m.visible, i)
+	} else {
+		m.visible = m.applySearchFilter(m.visible, m.query)
 	}
+
+	if m.secMode == SecurityOnly && m.query != "" {
+		filtered := m.applySearchFilter(nil, m.query)
+		// Keep only the search matches within the security-only list,
+		// preserving that list's severity ordering.
+		keep := make(map[int]bool, len(filtered))
+		for _, i := range filtered {
+			keep[i] = true
+		}
+		out := m.visible[:0]
+		for _, i := range m.visible {
+			if keep[i] {
+				out = append(out, i)
+			}
+		}
+		m.visible = out
+	}
+
 	if m.secMode != SecurityOff {
 		sort.SliceStable(m.visible, func(a, b int) bool {
 			return secUrgency(m.security[m.visible[a]]) > secUrgency(m.security[m.visible[b]])
 		})
 	}
+	m.rankBySearch(m.query)
+
 	if m.cursor >= len(m.visible) {
 		m.cursor = max(len(m.visible)-1, 0)
 	}
@@ -262,10 +292,29 @@ func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleListKey processes keyboard input on the list screen.
+// handleListKey processes keyboard input on the list screen. While the
+// search input has focus, all keys are handled by handleSearchKey instead.
 func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searching {
+		return m.handleSearchKey(msg)
+	}
+
 	switch msg.String() {
-	case "q", "esc":
+	case "/":
+		m.enterSearch()
+		return m, nil
+
+	case "q":
+		return m, tea.Quit
+
+	case "esc":
+		// Esc with an active (kept) filter clears it; with no filter it
+		// quits as before.
+		if m.query != "" {
+			m.query = ""
+			m.rebuildVisible()
+			return m, nil
+		}
 		return m, tea.Quit
 
 	case "up", "k":
@@ -482,10 +531,27 @@ func (m *Model) listView() string {
 	b.WriteString(titleStyle.Render("\n  goup — Go dependency updater"))
 	b.WriteString("\n\n")
 
+	// Search input line while search mode is active.
+	if m.searching {
+		b.WriteString(fmt.Sprintf("  %s %s█\n",
+			infoStyle.Render("Search:"),
+			m.query))
+		b.WriteString("\n")
+	} else if m.query != "" {
+		// A kept filter from a previous search (Enter exits search mode
+		// without clearing).
+		b.WriteString(fmt.Sprintf("  %s %s  %s\n",
+			dimmedStyle.Render("Filter:"),
+			m.query,
+			dimmedStyle.Render(fmt.Sprintf("(%d match%s)", len(m.visible), plural(len(m.visible))))))
+	}
+
 	// Subtitle and security summary.
 	updatesCount := len(m.visible)
-	b.WriteString(subtitleStyle.Render(fmt.Sprintf("  %d updates available", updatesCount)))
-	b.WriteString("\n")
+	if !m.searchActive() {
+		b.WriteString(subtitleStyle.Render(fmt.Sprintf("  %d updates available", updatesCount)))
+		b.WriteString("\n")
+	}
 	if m.secMode != SecurityOff {
 		if summary := Summarize(m.security); summary.HasIssues() {
 			b.WriteString("  " + summary.Render() + "\n")
@@ -494,6 +560,15 @@ func (m *Model) listView() string {
 		b.WriteString(dimmedStyle.Render("  security check disabled (--no-security)") + "\n")
 	}
 	b.WriteString("\n")
+
+	// Empty result state: no matches at all.
+	if len(m.visible) == 0 {
+		b.WriteString(dimmedStyle.Render("  No dependencies found.") + "\n\n")
+		b.WriteString(fmt.Sprintf("  %s %s\n",
+			infoStyle.Render("Esc"),
+			dimmedStyle.Render("Clear search")))
+		return appStyle.Render(b.String())
+	}
 
 	// Column headers.
 	columns := fmt.Sprintf("  %-45s %-12s %-12s %s",
@@ -528,6 +603,13 @@ func (m *Model) listView() string {
 
 	// Footer.
 	b.WriteString("\n")
+
+	// Match count while searching, subtle and non-intrusive.
+	if m.searching {
+		b.WriteString(fmt.Sprintf("  %s\n",
+			dimmedStyle.Render(fmt.Sprintf("%d of %d dependencies match",
+				len(m.visible), len(m.deps)))))
+	}
 
 	// Selection count.
 	selectedCount := len(m.selectedIndices())
@@ -602,9 +684,20 @@ func (m *Model) renderItem(depIdx int, dep module.Dependency, selected bool, isC
 	return style.Render(line)
 }
 
-// renderHelp shows the keyboard shortcuts. Security-related bindings are
-// hidden when the security feature is disabled.
+// renderHelp shows the keyboard shortcuts. Bindings adapt to mode:
+// security-related keys are hidden when disabled, and search mode swaps
+// the footer for its own control hints.
 func (m *Model) renderHelp() string {
+	if m.searching {
+		return strings.Join([]string{
+			fmt.Sprintf("%s %s", infoStyle.Render("Type"), dimmedStyle.Render("Search")),
+			fmt.Sprintf("%s %s", infoStyle.Render("↑/↓"), dimmedStyle.Render("Navigate")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Space"), dimmedStyle.Render("Select")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Enter"), dimmedStyle.Render("Apply")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Esc"), dimmedStyle.Render("Clear")),
+		}, "  ")
+	}
+
 	k := keyMap{}
 	bindings := k.help()
 	if m.secMode == SecurityOff {
@@ -623,6 +716,14 @@ func (m *Model) renderHelp() string {
 			dimmedStyle.Render(b.desc)))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// plural returns "" for 1 and "s" otherwise, for match counts.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "es"
 }
 
 // confirmView shows the confirmation screen.

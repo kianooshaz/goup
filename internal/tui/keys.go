@@ -10,6 +10,7 @@ func (k keyMap) help() []keyBinding {
 		{key: "Space", desc: "Select"},
 		{key: "a", desc: "All"},
 		{key: "n", desc: "None"},
+		{key: "/", desc: "Search"},
 		{key: "d", desc: "Security details"},
 		{key: "Enter", desc: "Upgrade"},
 		{key: "q/Esc", desc: "Quit"},
