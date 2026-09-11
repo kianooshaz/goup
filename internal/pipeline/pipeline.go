@@ -148,5 +148,7 @@ func (p *Pipeline) Run(ctx context.Context, includeIndirect bool, securityOn boo
 
 // Deadline is the overall discovery bound. Individual dependency checks
 // have their own shorter timeouts; this guards the whole phase so the UI
-// is never stuck in loading forever.
-const Deadline = 2 * time.Minute
+// is never stuck in loading forever. It is generous because `go list -u`
+// resolves the latest version of every module against the proxy, which is
+// slow on a large graph or a cold module cache.
+const Deadline = 10 * time.Minute

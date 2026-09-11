@@ -128,7 +128,7 @@ Press `s` for the full list with reasons:
       reason: network timeout
 ```
 
-Individual vulnerability lookups are bounded by a per-module timeout, and the whole loading phase has an overall deadline, so `goup` never hangs indefinitely.
+Individual vulnerability lookups are bounded by a per-module timeout, and the whole loading phase has an overall deadline of 10 minutes, so `goup` never hangs indefinitely.
 
 ## Search
 
