@@ -221,6 +221,12 @@ func (m *Model) rebuildVisible() {
 	if m.topIndex > m.cursor {
 		m.topIndex = m.cursor
 	}
+	// Guard against an offset past the end of a now-shorter list: the render
+	// loop starts at topIndex, so an out-of-range offset would draw no rows
+	// at all despite there being matches.
+	if m.topIndex >= len(m.visible) {
+		m.topIndex = max(len(m.visible)-1, 0)
+	}
 }
 
 // secUrgency ranks a dependency for list ordering: vulnerable deps by
@@ -521,8 +527,7 @@ func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Esc with an active (kept) filter clears it; with no filter it
 		// quits as before.
 		if m.query != "" {
-			m.query = ""
-			m.rebuildVisible()
+			m.setQuery("")
 			return m, nil
 		}
 		return m, tea.Quit

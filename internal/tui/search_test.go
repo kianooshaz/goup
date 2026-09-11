@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,19 @@ func visiblePaths(m *Model) []string {
 
 func joinPaths(m *Model) string {
 	return strings.Join(visiblePaths(m), ",")
+}
+
+// renderedRows returns the dependency rows actually drawn by View, as
+// opposed to m.visible (the rows the model considers matches). The two
+// diverging is exactly the bug these tests guard against.
+func renderedRows(m *Model) []string {
+	var rows []string
+	for _, line := range strings.Split(m.View(), "\n") {
+		if strings.Contains(line, "github.com/") || strings.Contains(line, "pkg-") {
+			rows = append(rows, strings.TrimSpace(line))
+		}
+	}
+	return rows
 }
 
 // --- Entering and exiting search mode ---
@@ -290,6 +304,115 @@ func TestSearchLiveFilteringPerKeystroke(t *testing.T) {
 	}
 	if len(m.visible) != 1 || m.deps[m.visible[0]].Path != "golang.org/x/net" {
 		t.Errorf("live filter after full query: %s", joinPaths(m))
+	}
+}
+
+// --- Scrolling interaction ---
+
+// TestSearchAfterScrollingShowsAllMatches is a regression test: scrolling to
+// the bottom and then searching used to leave the old scroll offset in
+// place, so the render loop started past the end of the newly shortened
+// list and most matches were invisible.
+func TestSearchAfterScrollingShowsAllMatches(t *testing.T) {
+	var paths []string
+	for i := 0; i < 30; i++ {
+		paths = append(paths, fmt.Sprintf("github.com/org/dep-%02d", i))
+	}
+	m := newSearchModel(paths...)
+
+	// Scroll well past the first screen.
+	for i := 0; i < 25; i++ {
+		m.handleListKey(key("down"))
+	}
+	if m.topIndex == 0 {
+		t.Fatalf("expected a non-zero scroll offset before searching, got %d", m.topIndex)
+	}
+
+	m.handleListKey(key("/"))
+	for _, c := range "dep-0" {
+		m.handleSearchKey(key(string(c)))
+	}
+
+	if len(m.visible) != 10 {
+		t.Fatalf("query should match dep-00..dep-09, got %s", joinPaths(m))
+	}
+	// Every match must be rendered, not just the tail below the old offset.
+	rendered := renderedRows(m)
+	if len(rendered) != len(m.visible) {
+		t.Errorf("%d matches but only %d rows rendered", len(m.visible), len(rendered))
+	}
+	if !strings.Contains(m.View(), "github.com/org/dep-00") {
+		t.Errorf("the first match should be visible: %q", m.View())
+	}
+}
+
+// TestSearchResetsScrollPosition pins the intended behavior directly.
+func TestSearchResetsScrollPosition(t *testing.T) {
+	var paths []string
+	for i := 0; i < 30; i++ {
+		paths = append(paths, fmt.Sprintf("github.com/org/dep-%02d", i))
+	}
+	m := newSearchModel(paths...)
+	for i := 0; i < 25; i++ {
+		m.handleListKey(key("down"))
+	}
+
+	m.handleListKey(key("/"))
+	m.handleSearchKey(key("d"))
+
+	if m.cursor != 0 || m.topIndex != 0 {
+		t.Errorf("a new query should return to the top, got cursor=%d topIndex=%d",
+			m.cursor, m.topIndex)
+	}
+}
+
+// TestClearingSearchRestoresScrollFromTop makes sure clearing the filter
+// also resets the offset rather than stranding the view mid-list.
+func TestClearingSearchRestoresScrollFromTop(t *testing.T) {
+	var paths []string
+	for i := 0; i < 30; i++ {
+		paths = append(paths, fmt.Sprintf("github.com/org/dep-%02d", i))
+	}
+	m := newSearchModel(paths...)
+	for i := 0; i < 25; i++ {
+		m.handleListKey(key("down"))
+	}
+	m.handleListKey(key("/"))
+	for _, c := range "dep-0" {
+		m.handleSearchKey(key(string(c)))
+	}
+
+	m.handleSearchKey(key("esc"))
+
+	if m.query != "" {
+		t.Fatalf("query should be cleared, got %q", m.query)
+	}
+	if len(m.visible) != 30 {
+		t.Fatalf("full list should be restored, got %d", len(m.visible))
+	}
+	if m.cursor != 0 || m.topIndex != 0 {
+		t.Errorf("clearing should return to the top, got cursor=%d topIndex=%d",
+			m.cursor, m.topIndex)
+	}
+}
+
+// TestRebuildVisibleClampsStaleOffset covers the defensive clamp: even if a
+// stale offset reaches rebuildVisible, it must not suppress rendering.
+func TestRebuildVisibleClampsStaleOffset(t *testing.T) {
+	m := newSearchModel("github.com/a", "github.com/b")
+	m.topIndex = 99
+	m.cursor = 99
+
+	m.rebuildVisible()
+
+	if m.topIndex >= len(m.visible) {
+		t.Errorf("topIndex %d should be clamped into range (visible=%d)", m.topIndex, len(m.visible))
+	}
+	if m.cursor >= len(m.visible) {
+		t.Errorf("cursor %d should be clamped into range (visible=%d)", m.cursor, len(m.visible))
+	}
+	if renderedRows(m) == nil {
+		t.Error("list should still render rows after clamping")
 	}
 }
 

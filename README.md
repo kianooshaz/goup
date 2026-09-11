@@ -253,6 +253,53 @@ go vet ./...
 go build ./cmd/goup
 ```
 
+### Makefile
+
+A `Makefile` wraps the common workflows. `make` with no target lists them:
+
+```sh
+make help
+```
+
+The one worth knowing is `make demo`: it builds goup, runs the test suite,
+and then launches goup against the bundled `example/` module, which pins
+deliberately outdated dependency versions (including a vulnerable
+`golang.org/x/text`) so there is always something to see.
+
+```sh
+make demo            # build, test, then run goup against example/
+make demo-security   # same, filtered to vulnerable dependencies only
+make demo-scripted   # non-interactive: prints the rendered UI, no terminal needed
+make test            # go test ./...
+make test-race       # go test -race ./...
+make check           # gofmt check, go vet, go test
+make build           # binary at bin/goup
+make example-reset   # restore example/'s outdated pins after upgrading them
+make clean           # remove bin/
+```
+
+Because `make demo` lets you actually perform upgrades, it rewrites
+`example/go.mod`. Run `make example-reset` to put the outdated versions back.
+
+### The example module
+
+`example/` is a small program that imports seven real dependencies and pins
+old versions of them, so goup has genuine work to do:
+
+```text
+github.com/google/uuid      v1.3.0 → v1.6.0
+github.com/rs/zerolog       v1.29.0 → v1.35.1
+github.com/sirupsen/logrus  v1.9.0 → v1.10.2    🟠 HIGH (2)  fixed by upgrade
+github.com/spf13/cobra      v1.7.0 → v1.10.2
+github.com/stretchr/testify v1.8.0 → v1.12.1
+golang.org/x/text           v0.3.7 → v0.42.0    🟠 HIGH (3)  fixed by upgrade
+```
+
+Two of them carry real advisories, so the security column, the `--security`
+filter, and the `d` detail view all have something to display. `demo.sh` in
+that directory drives the TUI through a pseudo-terminal so the interface can
+be exercised from a script or CI.
+
 ## Versioned builds
 
 Development builds report `dev` by default. A release version can be embedded at build time with Go linker flags:

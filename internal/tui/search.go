@@ -28,9 +28,8 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		// Clear the query and exit search mode, restoring the full list.
-		m.query = ""
 		m.searching = false
-		m.rebuildVisible()
+		m.setQuery("")
 		return m, nil
 
 	case "enter":
@@ -40,8 +39,7 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "backspace", "ctrl+h":
 		if r := []rune(m.query); len(r) > 0 {
-			m.query = string(r[:len(r)-1])
-			m.rebuildVisible()
+			m.setQuery(string(r[:len(r)-1]))
 		}
 
 	case "up":
@@ -63,8 +61,7 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	default:
 		if runes := msg.Runes; len(runes) > 0 {
-			m.query += string(runes)
-			m.rebuildVisible()
+			m.setQuery(m.query + string(runes))
 		}
 	}
 	return m, nil
@@ -73,6 +70,18 @@ func (m *Model) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // rebuildVisible is defined in model.go; the search stage below documents
 // its ordering: security-only filter, then search filter, then security
 // urgency, then prefix ranking — each stable over the previous.
+
+// setQuery replaces the search query and rebuilds the visible list. It also
+// returns the view to the top: a new filter reorders and shortens the list,
+// so a scroll offset left over from the previous (longer) list would hide
+// the best matches above the fold — scrolling to the bottom and then
+// searching used to show only the last few rows of the result.
+func (m *Model) setQuery(q string) {
+	m.query = q
+	m.cursor = 0
+	m.topIndex = 0
+	m.rebuildVisible()
+}
 
 // applySearchFilter appends to dst the indices of deps whose module path
 // contains query (case-insensitive substring). An empty query matches
