@@ -18,7 +18,24 @@ func newSearchModel(paths ...string) *Model {
 	for i, p := range paths {
 		deps[i] = module.Dependency{Path: p, CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"}
 	}
-	return NewModel(deps, nil, SecurityOff, nil)
+	m := NewModel(nil, SecurityOff)
+	m.deps = deps
+	m.screen = screenList
+	m.rebuildVisible()
+	return m
+}
+
+// newModelWithSecurity builds a list-screen model with the given deps and
+// security data under the requested security mode.
+func newModelWithSecurity(deps []module.Dependency, sec []security.DependencyStatus, mode SecurityMode) *Model {
+	m := NewModel(nil, mode)
+	m.deps = deps
+	if sec != nil {
+		m.security = sec
+	}
+	m.screen = screenList
+	m.rebuildVisible()
+	return m
 }
 
 func key(s string) tea.KeyMsg {
@@ -387,7 +404,7 @@ func TestSearchWithSecurityIndicators(t *testing.T) {
 		{Path: "golang.org/x/sync", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
 		{Path: "github.com/other", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
 	}
-	m := NewModel(deps, securityItemsFor(deps, "golang.org/x/net"), SecurityOn, nil)
+	m := newModelWithSecurity(deps, securityItemsFor(deps, "golang.org/x/net"), SecurityOn)
 	m.handleListKey(key("/"))
 	for _, c := range "golang.org/x" {
 		m.handleSearchKey(key(string(c)))
@@ -413,7 +430,7 @@ func TestSearchWithSecurityOnlyMode(t *testing.T) {
 		{Path: "github.com/vuln", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
 	}
 	// Both golang.org deps are vulnerable; github.com/vuln also vulnerable.
-	m := NewModel(deps, securityItemsFor(deps, "golang.org/x/net"), SecurityOnly, nil)
+	m := newModelWithSecurity(deps, securityItemsFor(deps, "golang.org/x/net"), SecurityOnly)
 	// Make golang.org/x/clean clean too by rebuilding its status.
 	m.security[1].Status.Vulnerabilities = nil
 	m.security[1].Status.Severity = security.SeverityNone
@@ -441,7 +458,7 @@ func TestSearchWithIndirectDependencies(t *testing.T) {
 	}
 	// Discovery already applied the --indirect filter before the TUI; the
 	// model receives the combined list and search filters it.
-	m := NewModel(deps, nil, SecurityOff, nil)
+	m := newModelWithSecurity(deps, nil, SecurityOff)
 	m.handleListKey(key("/"))
 	for _, c := range "golang.org/x" {
 		m.handleSearchKey(key(string(c)))
@@ -510,7 +527,7 @@ func TestSearchPerformance(t *testing.T) {
 	for i := range paths {
 		paths[i] = module.Dependency{Path: "github.com/org/repo-" + string(rune('a'+i%26)) + "/" + time.Duration(i).String()}
 	}
-	m := NewModel(paths, nil, SecurityOff, nil)
+	m := newModelWithSecurity(paths, nil, SecurityOff)
 	start := time.Now()
 	m.handleListKey(key("/"))
 	for _, c := range "repo" {

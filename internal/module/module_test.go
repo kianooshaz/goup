@@ -56,20 +56,6 @@ func TestUpdateTypeString(t *testing.T) {
 	}
 }
 
-func TestDependencySummary(t *testing.T) {
-	dep := Dependency{
-		Path:           "github.com/foo/bar",
-		CurrentVersion: "v1.0.0",
-		LatestVersion:  "v2.0.0",
-		Indirect:       false,
-		UpdateType:     UpdateMajor,
-	}
-	want := "github.com/foo/bar v1.0.0 → v2.0.0"
-	if got := dep.Summary(); got != want {
-		t.Errorf("Dependency.Summary() = %q, want %q", got, want)
-	}
-}
-
 func TestFilterDirectOnly(t *testing.T) {
 	deps := []Dependency{
 		{Path: "github.com/a/direct", Indirect: false},

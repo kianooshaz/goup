@@ -42,7 +42,7 @@ Usage:
 
 Flags:
   --indirect      Include indirect dependencies
-  --security      Show only dependencies with security issues
+  --security      Show only dependencies with known vulnerabilities
   --no-security   Skip the vulnerability check
   --dir string    Go module directory (default: current directory)
   --version       Show version
@@ -71,7 +71,7 @@ goup --dir /path/to/module
 goup --version
 ```
 
-The selected directory must contain a `go.mod` file. If no updates are available, `goup` exits without starting the TUI. Interactive operation requires a terminal attached to standard input.
+The selected directory must contain a `go.mod` file. Interactive operation requires a terminal attached to standard input. The interface starts immediately and reports progress while discovery runs; when there are no updates it says so in the list rather than exiting silently.
 
 ## Interactive controls
 
@@ -83,11 +83,52 @@ The selected directory must contain a `go.mod` file. If no updates are available
 | `n` | Select no dependencies |
 | `/` | Search dependencies by module path |
 | `d` | Show security details for the current dependency |
+| `s` | Show skipped dependencies (when any exist) |
 | `Enter` | Continue to review or start upgrades |
 | `q` / `Esc` | Quit, clear search, or return from the detail view |
 | `Ctrl+C` | Quit |
 
 After confirmation, `goup` runs `go get` for each selected dependency and then runs `go mod tidy`. Upgrade failures are reported individually while processing continues for the remaining selections.
+
+## Loading and skipped dependencies
+
+The interface appears immediately with a loading state while dependency discovery and the security check run in the background — the UI stays responsive the whole time:
+
+```text
+  | Discovering dependencies...
+
+  q Cancel
+```
+
+then, during the vulnerability check:
+
+```text
+  | Checking for known vulnerabilities...
+  · Checking github.com/gin-gonic/gin
+  · 8 of 24
+```
+
+Failures never stop the run. A module that cannot be loaded or checked is skipped individually while everything else continues, and skipped modules are counted on the list screen:
+
+```text
+  12 updates available
+
+  ⚠ 2 dependencies skipped (s for details)
+```
+
+Press `s` for the full list with reasons:
+
+```text
+  Skipped dependencies
+
+  ⚠ github.com/example/foo
+      reason: failed to fetch version information
+
+  ⚠ github.com/example/bar
+      reason: network timeout
+```
+
+Individual vulnerability lookups are bounded by a per-module timeout, and the whole loading phase has an overall deadline, so `goup` never hangs indefinitely.
 
 ## Search
 
@@ -167,8 +208,7 @@ Search: golang.org/x█
   ● 1 selected
 ```
 
-With `--security`, search narrows the already-filtered vulnerable list;
-with `--indirect`, both direct and indirect matches appear.
+With `--security`, the list is narrowed to the dependencies that have known vulnerabilities among their available updates (the check still runs, so this is a filtered view of the same data); a run that finds nothing vulnerable says so. With `--indirect`, both direct and indirect matches appear.
 
 ## Security check
 
@@ -226,10 +266,11 @@ go build \
 
 ## How it works
 
-1. Runs `go list -m -u -json all` for the selected module.
-2. Filters out the main module, dependencies without available updates, and indirect dependencies unless `--indirect` is used.
-3. Sorts direct dependencies before indirect dependencies.
-4. Checks each installed version for known vulnerabilities (unless `--no-security`).
-5. Presents available updates in the terminal UI, with vulnerable dependencies first.
-6. Runs `go get <module>@<version>` for each confirmed selection.
-7. Runs `go mod tidy` to clean up module files.
+1. Starts the terminal UI immediately with a loading state.
+2. In the background, runs `go list -m -u -e -json all` for the selected module; modules that fail to load are skipped individually and reported.
+3. Filters out the main module, dependencies without available updates, and indirect dependencies unless `--indirect` is used.
+4. Sorts direct dependencies before indirect dependencies.
+5. Checks each installed version for known vulnerabilities (unless `--no-security`), with per-module timeouts.
+6. Presents available updates in the terminal UI, with vulnerable dependencies first.
+7. Runs `go get <module>@<version>` for each confirmed selection.
+8. Runs `go mod tidy` to clean up module files.

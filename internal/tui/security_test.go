@@ -187,7 +187,7 @@ func newDetailModel(items []security.DependencyStatus) *Model {
 	for i, it := range items {
 		deps[i] = it.Dependency
 	}
-	m := NewModel(deps, items, SecurityOn, nil)
+	m := newModelWithSecurity(deps, items, SecurityOn)
 	m.width = 100
 	return m
 }
@@ -275,7 +275,7 @@ func TestListViewSecurityFirstOrdering(t *testing.T) {
 		ds(deps[1], vulnStatus(testVulnHigh), security.FixResolved),
 	}
 
-	m := NewModel(deps, items, SecurityOn, nil)
+	m := newModelWithSecurity(deps, items, SecurityOn)
 	// Vulnerable dependency must be listed first.
 	if got := m.visible[0]; got != 1 {
 		t.Errorf("first visible = deps[%d] (%s), want the vulnerable dep",
@@ -301,7 +301,7 @@ func TestListViewSecurityOnlyFilter(t *testing.T) {
 		ds(deps[1], vulnStatus(testVulnHigh), security.FixResolved),
 	}
 
-	m := NewModel(deps, items, SecurityOnly, nil)
+	m := newModelWithSecurity(deps, items, SecurityOnly)
 	if len(m.visible) != 1 || m.visible[0] != 1 {
 		t.Fatalf("security-only mode should list only the vulnerable dep, got %+v", m.visible)
 	}
@@ -325,7 +325,7 @@ func TestListViewSecurityOff(t *testing.T) {
 		ds(deps[1], vulnStatus(testVulnHigh), security.FixResolved),
 	}
 
-	m := NewModel(deps, items, SecurityOff, nil)
+	m := newModelWithSecurity(deps, items, SecurityOff)
 	if len(m.visible) != 2 {
 		t.Fatalf("security-off shows all deps, got %d", len(m.visible))
 	}
@@ -341,7 +341,7 @@ func TestListViewSecurityOff(t *testing.T) {
 }
 
 func TestSecurityForIndexOutOfRange(t *testing.T) {
-	m := NewModel(nil, nil, SecurityOn, nil)
+	m := NewModel(nil, SecurityOn)
 	got := m.securityFor(5)
 	if got.Status.Checked || got.Dependency.Path != "" {
 		t.Errorf("out-of-range securityFor should return zero value, got %+v", got)

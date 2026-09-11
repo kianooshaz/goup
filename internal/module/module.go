@@ -1,7 +1,6 @@
 package module
 
 import (
-	"fmt"
 	"sort"
 )
 
@@ -56,11 +55,6 @@ func SortDependencies(deps []Dependency) {
 	sort.Sort(ByDirectThenPath(deps))
 }
 
-// Summary provides a human-readable description of the version change.
-func (d Dependency) Summary() string {
-	return fmt.Sprintf("%s %s → %s", d.Path, d.CurrentVersion, d.LatestVersion)
-}
-
 // GoListModule mirrors the JSON shape of "go list -m -json" output.
 // Only the fields we use are included.
 type GoListModule struct {
@@ -72,4 +66,9 @@ type GoListModule struct {
 		Path    string `json:"path"`
 		Version string `json:"version"`
 	} `json:"update"`
+	// Error is set when go could not load the module; only reported when
+	// the -e flag is used. Such modules are skipped individually.
+	Error *struct {
+		Err string `json:"Err"`
+	} `json:"error"`
 }

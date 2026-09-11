@@ -133,9 +133,9 @@ func (s Status) CheckedOK() bool {
 	return s.Checked && s.Err == nil
 }
 
-// SeverityFor returns the severity for a set of vulnerabilities, or
-// SeverityNone when the set is empty. Returns SeverityUnknown only when
-// explicitly passed as an input.
+// worstSeverity returns the most serious severity in a set, or
+// SeverityNone when the set is empty. SeverityUnknown is returned only when
+// it is the worst of a non-empty set.
 func worstSeverity(vulns []Vulnerability) Severity {
 	if len(vulns) == 0 {
 		return SeverityNone

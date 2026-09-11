@@ -176,8 +176,16 @@ func (s SecuritySummary) Render() string {
 
 // detailView renders the full security detail screen for one dependency:
 // every vulnerability individually, with affected ranges and the fix
-// assessment. Keyed with "d" from the list; Esc returns.
+// assessment. Keyed with "d" from the list; Esc returns. The list key
+// handler only opens this screen when security data is present, so the
+// out-of-range branch is a defensive guard rather than a reachable state.
 func (m *Model) detailView() string {
+	if m.detailIndex < 0 || m.detailIndex >= len(m.security) {
+		return appStyle.Render(titleStyle.Render("\n  Security details") +
+			"\n\n" +
+			dimmedStyle.Render("  No security information available for this dependency.") +
+			fmt.Sprintf("\n\n  %s  %s\n", infoStyle.Render("Esc/d"), dimmedStyle.Render("Back")))
+	}
 	item := m.security[m.detailIndex]
 	dep := item.Dependency
 

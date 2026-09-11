@@ -240,42 +240,9 @@ func TestEnrichUnknownSeverityPreserved(t *testing.T) {
 	}
 }
 
-func TestFilterVulnerable(t *testing.T) {
-	fp := newFakeProvider()
-	fp.add("github.com/foo/vuln", vulnHigh)
-
-	deps := []module.Dependency{
-		{Path: "github.com/foo/vuln", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
-		{Path: "github.com/foo/clean", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
-	}
-	items := Enrich(context.Background(), NewChecker(fp, nil), deps)
-
-	vulns := FilterVulnerable(items)
-	if len(vulns) != 1 || vulns[0].Dependency.Path != "github.com/foo/vuln" {
-		t.Errorf("FilterVulnerable returned %+v, want only github.com/foo/vuln", vulns)
-	}
-}
-
-func TestSortBySecurity(t *testing.T) {
-	fp := newFakeProvider()
-	fp.add("github.com/foo/low", Vulnerability{ID: "X", Severity: SeverityLow})
-	fp.add("github.com/foo/crit", vulnCritical)
-
-	deps := []module.Dependency{
-		{Path: "github.com/foo/clean", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
-		{Path: "github.com/foo/low", CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0"},
-		{Path: "github.com/foo/crit", CurrentVersion: "v1.0.0", LatestVersion: "v2.0.0"},
-	}
-	items := Enrich(context.Background(), NewChecker(fp, nil), deps)
-	SortBySecurity(items)
-
-	want := []string{"github.com/foo/crit", "github.com/foo/low", "github.com/foo/clean"}
-	for i, w := range want {
-		if items[i].Dependency.Path != w {
-			t.Errorf("position %d = %s, want %s", i, items[i].Dependency.Path, w)
-		}
-	}
-}
+// Filtering to vulnerable items and security-urgency ordering now live in
+// the TUI layer (Model.rebuildVisible and secUrgency), which is their only
+// consumer, and are covered by the list-view tests in internal/tui.
 
 // --- Cache scenarios ---
 
