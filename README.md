@@ -1,8 +1,8 @@
 # goup
 
-`goup` is an interactive terminal UI for inspecting and updating Go module dependencies.
+`goup` is an interactive terminal UI for inspecting and updating Go module dependencies, with an integrated security check.
 
-It discovers available updates, classifies them as patch, minor, major, or unknown, lets you select which dependencies to upgrade, and runs `go mod tidy` after the updates.
+It discovers available updates, classifies them as patch, minor, major, or unknown, shows which installed versions have known vulnerabilities, lets you select which dependencies to upgrade, and runs `go mod tidy` after the updates.
 
 ## Requirements
 
@@ -41,10 +41,12 @@ Usage:
   goup [flags]
 
 Flags:
-  --indirect    Include indirect dependencies
-  --dir string  Go module directory (default: current directory)
-  --version     Show version
-  -h, --help    Show help
+  --indirect      Include indirect dependencies
+  --security      Show only dependencies with known vulnerabilities
+  --no-security   Skip the vulnerability check
+  --dir string    Go module directory (default: current directory)
+  --version       Show version
+  -h, --help      Show help
 ```
 
 Examples:
@@ -56,6 +58,12 @@ goup
 # Include indirect dependencies
 goup --indirect
 
+# Focus on dependencies with known vulnerabilities
+goup --security
+
+# Skip the vulnerability check entirely
+goup --no-security
+
 # Operate on another Go module
 goup --dir /path/to/module
 
@@ -63,7 +71,7 @@ goup --dir /path/to/module
 goup --version
 ```
 
-The selected directory must contain a `go.mod` file. If no updates are available, `goup` exits without starting the TUI. Interactive operation requires a terminal attached to standard input.
+The selected directory must contain a `go.mod` file. Interactive operation requires a terminal attached to standard input. The interface starts immediately and reports progress while discovery runs; when there are no updates it says so in the list rather than exiting silently.
 
 ## Interactive controls
 
@@ -73,11 +81,154 @@ The selected directory must contain a `go.mod` file. If no updates are available
 | `Space` | Toggle the current dependency |
 | `a` | Select all dependencies |
 | `n` | Select no dependencies |
+| `/` | Search dependencies by module path |
+| `d` | Show security details for the current dependency |
+| `s` | Show skipped dependencies (when any exist) |
 | `Enter` | Continue to review or start upgrades |
-| `q` / `Esc` | Quit or cancel |
+| `q` / `Esc` | Quit, clear search, or return from the detail view |
 | `Ctrl+C` | Quit |
 
 After confirmation, `goup` runs `go get` for each selected dependency and then runs `go mod tidy`. Upgrade failures are reported individually while processing continues for the remaining selections.
+
+## Loading and skipped dependencies
+
+The interface appears immediately with a loading state while dependency discovery and the security check run in the background — the UI stays responsive the whole time:
+
+```text
+  | Discovering dependencies...
+
+  q Cancel
+```
+
+then, during the vulnerability check:
+
+```text
+  | Checking for known vulnerabilities...
+  · Checking github.com/gin-gonic/gin
+  · 8 of 24
+```
+
+Failures never stop the run. A module that cannot be loaded or checked is skipped individually while everything else continues, and skipped modules are counted on the list screen:
+
+```text
+  12 updates available
+
+  ⚠ 2 dependencies skipped (s for details)
+```
+
+Press `s` for the full list with reasons:
+
+```text
+  Skipped dependencies
+
+  ⚠ github.com/example/foo
+      reason: failed to fetch version information
+
+  ⚠ github.com/example/bar
+      reason: network timeout
+```
+
+Individual vulnerability lookups are bounded by a per-module timeout, and the whole loading phase has an overall deadline of 10 minutes, so `goup` never hangs indefinitely.
+
+## Search
+
+Press `/` on the dependency list to filter by module path. Matching is case-insensitive substring matching against module paths and updates live as you type — entirely in memory, with no network or re-discovery.
+
+### Example session
+
+Start with the full update list:
+
+```text
+  8 updates available
+
+  ◯ github.com/gin-gonic/gin     v1.9.1  → v1.10.0   direct    ✓
+  ◯ github.com/google/uuid       v1.6.0  → v1.7.0    direct    ✓
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH
+  ◯ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
+
+  ↑/↓ Navigate  Space Select  / Search  d Details  Enter Upgrade  q Quit
+```
+
+Press `/` and type `golang.org/x` — the list narrows on every keystroke:
+
+```text
+Search: golang.org/x█
+
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH  ✓ fixed by upgrade
+  ◯ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
+
+  3 of 8 dependencies match
+
+  Type Search  ↑/↓ Navigate  Space Select  Enter Apply  Esc Clear
+```
+
+Search finds what you meant without the full path — `redis` matches
+`github.com/redis/go-redis/v9`, `x/sync` matches `golang.org/x/sync`,
+and `GOLANG.ORG/X` matches all three `golang.org/x/*` modules. Paths
+whose segment starts with the query rank first:
+
+```text
+Search: redis█
+
+  ◯ github.com/redis/go-redis/v9   v9.5.1 → v9.7.0   indirect   ✓
+  ◯ github.com/foo/redis-wrapper   v1.0.2 → v1.1.0   direct     ✓
+
+  2 of 8 dependencies match
+```
+
+Press `Enter` to keep the filter applied while you work, or `Esc` to
+clear it and restore the full list:
+
+```text
+  Search cleared.
+
+  8 updates available
+
+  ◯ github.com/gin-gonic/gin     v1.9.1  → v1.10.0   direct    ✓
+  ...
+```
+
+### Search + security + selection
+
+Security badges and direct/indirect labels stay on filtered rows, and
+selections belong to the dependency — not to its position — so they
+survive filtering. Select while filtered, clear, and everything you
+ticked is still ticked:
+
+```text
+Search: golang.org/x█
+
+  ◯ golang.org/x/net             v0.24.0 → v0.30.0   direct    🔴 HIGH
+  ◉ golang.org/x/sync            v0.6.0  → v0.8.0    direct    ✓
+  ◯ golang.org/x/text            v0.9.0  → v0.10.0   direct    ✓
+
+  3 of 8 dependencies match
+  ● 1 selected
+```
+
+With `--security`, the list is narrowed to the dependencies that have known vulnerabilities among their available updates (the check still runs, so this is a filtered view of the same data); a run that finds nothing vulnerable says so. With `--indirect`, both direct and indirect matches appear.
+
+## Security check
+
+When updates are listed, `goup` checks each installed version against the official Go vulnerability data served through the OSV ecosystem API (`api.osv.dev`). The list shows a severity badge per dependency:
+
+```text
+  ◯ github.com/foo/bar   v1.4.2 → v1.4.5   direct    🟠 HIGH (1)  ✓ fixed by upgrade
+  ◯ github.com/foo/baz   v1.2.0 → v1.3.0   direct    ✓
+```
+
+- Dependencies with vulnerabilities are sorted to the top; the rest keep the normal order.
+- The header summarizes how many updates contain security fixes, by severity.
+- Nothing is ever pre-selected — the user stays in control.
+- Pressing `d` on a dependency opens a detail view listing every vulnerability with its ID, severity, fixed version, and whether the available upgrade resolves it. The tool compares against the concrete fixed version, so it can also warn when the latest version is still affected or when no fixed version exists.
+- If the vulnerability database cannot be reached, affected rows show `⚠ security check failed` instead of a clean bill of health. A failed check is never presented as "no known issues".
+- Vulnerabilities found at the module level are labeled *known vulnerabilities*: the lightweight scan does not analyze reachability. A future deep scan (govulncheck-style call graph analysis) will distinguish code that is actually called by your application.
+- Checks touch public modules only by module path and version — no source code or project contents are sent anywhere. Modules that cannot be hosted publicly (dotless first path element) are skipped and shown as `private module: not checked`.
+- Results are cached on disk for 24 hours (`~/Library/Caches/goup` / `~/.cache/goup` on Linux) so repeated runs stay fast.
+
+The severity badge vocabulary is `🔴 CRITICAL`, `🟠 HIGH`, `🟡 MEDIUM`, `🔵 LOW`, `⚪ UNKNOWN` (severity not provided by the database — never guessed), and `✓` for no known issues.
 
 ## Development
 
@@ -102,6 +253,53 @@ go vet ./...
 go build ./cmd/goup
 ```
 
+### Makefile
+
+A `Makefile` wraps the common workflows. `make` with no target lists them:
+
+```sh
+make help
+```
+
+The one worth knowing is `make demo`: it builds goup, runs the test suite,
+and then launches goup against the bundled `example/` module, which pins
+deliberately outdated dependency versions (including a vulnerable
+`golang.org/x/text`) so there is always something to see.
+
+```sh
+make demo            # build, test, then run goup against example/
+make demo-security   # same, filtered to vulnerable dependencies only
+make demo-scripted   # non-interactive: prints the rendered UI, no terminal needed
+make test            # go test ./...
+make test-race       # go test -race ./...
+make check           # gofmt check, go vet, go test
+make build           # binary at bin/goup
+make example-reset   # restore example/'s outdated pins after upgrading them
+make clean           # remove bin/
+```
+
+Because `make demo` lets you actually perform upgrades, it rewrites
+`example/go.mod`. Run `make example-reset` to put the outdated versions back.
+
+### The example module
+
+`example/` is a small program that imports seven real dependencies and pins
+old versions of them, so goup has genuine work to do:
+
+```text
+github.com/google/uuid      v1.3.0 → v1.6.0
+github.com/rs/zerolog       v1.29.0 → v1.35.1
+github.com/sirupsen/logrus  v1.9.0 → v1.10.2    🟠 HIGH (2)  fixed by upgrade
+github.com/spf13/cobra      v1.7.0 → v1.10.2
+github.com/stretchr/testify v1.8.0 → v1.12.1
+golang.org/x/text           v0.3.7 → v0.42.0    🟠 HIGH (3)  fixed by upgrade
+```
+
+Two of them carry real advisories, so the security column, the `--security`
+filter, and the `d` detail view all have something to display. `demo.sh` in
+that directory drives the TUI through a pseudo-terminal so the interface can
+be exercised from a script or CI.
+
 ## Versioned builds
 
 Development builds report `dev` by default. A release version can be embedded at build time with Go linker flags:
@@ -115,9 +313,11 @@ go build \
 
 ## How it works
 
-1. Runs `go list -m -u -json all` for the selected module.
-2. Filters out the main module, dependencies without available updates, and indirect dependencies unless `--indirect` is used.
-3. Sorts direct dependencies before indirect dependencies.
-4. Presents available updates in the terminal UI.
-5. Runs `go get <module>@<version>` for each confirmed selection.
-6. Runs `go mod tidy` to clean up module files.
+1. Starts the terminal UI immediately with a loading state.
+2. In the background, runs `go list -m -u -e -json all` for the selected module; modules that fail to load are skipped individually and reported.
+3. Filters out the main module, dependencies without available updates, and indirect dependencies unless `--indirect` is used.
+4. Sorts direct dependencies before indirect dependencies.
+5. Checks each installed version for known vulnerabilities (unless `--no-security`), with per-module timeouts.
+6. Presents available updates in the terminal UI, with vulnerable dependencies first.
+7. Runs `go get <module>@<version>` for each confirmed selection.
+8. Runs `go mod tidy` to clean up module files.

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -11,6 +12,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/kianooshaz/goup/internal/module"
+	"github.com/kianooshaz/goup/internal/pipeline"
+	"github.com/kianooshaz/goup/internal/security"
 	"github.com/kianooshaz/goup/internal/updater"
 )
 
@@ -20,28 +23,67 @@ type screen int
 const (
 	screenLoading screen = iota
 	screenList
+	screenSkipped
+	screenDetail
 	screenConfirm
 	screenUpgrading
 	screenDone
 	screenError
 )
 
+// SecurityMode determines how security data appears in the list.
+type SecurityMode int
+
+const (
+	// SecurityOn shows badges, summary, and security-first sorting.
+	SecurityOn SecurityMode = iota
+	// SecurityOnly filters the list to vulnerable dependencies.
+	SecurityOnly
+	// SecurityOff hides all security columns and sorting.
+	SecurityOff
+)
+
 // Model is the main Bubble Tea model for the goup TUI.
 type Model struct {
 	// Dependencies data.
 	deps []module.Dependency
-	// Selected tracks which dependencies are selected (by index).
+	// Selected tracks which dependencies are selected (by index into deps).
 	selected map[int]bool
 
+	// Security data. security aligns by index with deps; visible holds the
+	// indices of deps shown on the list screen (all of them, or only
+	// vulnerable ones in security-only mode).
+	security []security.DependencyStatus
+	visible  []int
+	secMode  SecurityMode
+
+	// Modules that could not be processed during discovery; shown on the
+	// skipped detail screen.
+	skipped []module.SkippedDependency
+
+	// Search state: query filters visible by module path, searching is
+	// true while the search input has focus. Selections are keyed by
+	// dependency index and are unaffected by filtering.
+	query     string
+	searching bool
+
+	// Detail view state: index into security/deps shown on screenDetail.
+	detailIndex int
+
 	// UI state.
-	screen    screen
-	cursor    int
-	topIndex  int // first visible item in the viewport
-	width     int
-	height    int
+	screen   screen
+	cursor   int
+	topIndex int // first visible item in the viewport
+	width    int
+	height   int
 
 	// Loading/error state.
-	loadingErr error
+	loadingErr   error
+	loadingStage pipeline.Stage
+	loadingMod   string // module currently being processed
+	loadingDone  int
+	loadingTotal int
+	haveResult   bool // discovery finished at least once
 
 	// Confirm screen.
 	confirmDeps []int // indices of selected deps for confirmation
@@ -64,12 +106,21 @@ type Model struct {
 	updater         *updater.Updater
 	upgradeProgress chan updater.ProgressUpdate
 
-	// Message to show on the done screen.
-	doneMessage string
+	// pipelineMsgs carries pipeline events (progress, then exactly one
+	// result or error) from the background goroutine to the UI. Each
+	// message is followed by a fresh waitForPipeline command so the
+	// channel keeps being drained until it closes.
+	pipelineMsgs <-chan tea.Msg
+
+	// initCmd, when set, is returned by Init once — used to launch the
+	// background discovery pipeline as the program's initial command.
+	initCmd tea.Cmd
 }
 
-// NewModel creates a new TUI model with the given dependencies and updater.
-func NewModel(deps []module.Dependency, u *updater.Updater) *Model {
+// NewModel creates a TUI model in the loading state: the UI starts
+// immediately and the pipeline fills in deps/security/skipped via
+// ApplyResult as discovery progresses in the background.
+func NewModel(u *updater.Updater, mode SecurityMode) *Model {
 	s := spinner.New()
 	s.Spinner = spinner.Line
 	s.Style = infoStyle
@@ -78,23 +129,151 @@ func NewModel(deps []module.Dependency, u *updater.Updater) *Model {
 	vp.Style = lipgloss.NewStyle().Padding(0, 1)
 
 	return &Model{
-		deps:      deps,
-		selected:  make(map[int]bool),
-		screen:    screenList,
-		cursor:    0,
-		topIndex:  0,
-		spinner:   s,
-		viewport:  vp,
-		updater:   u,
+		selected: make(map[int]bool),
+		secMode:  mode,
+		screen:   screenLoading,
+		spinner:  s,
+		viewport: vp,
+		updater:  u,
 	}
+}
+
+// ApplyResult incorporates a completed pipeline result. The first result
+// transitions from the loading screen to the list; later results (none in
+// the current single-shot pipeline) would refresh data in place.
+func (m *Model) ApplyResult(res pipeline.Result) {
+	m.deps = res.Dependencies
+	m.skipped = res.Skipped
+	if res.SecurityDisabled {
+		m.secMode = SecurityOff
+	} else if res.Security != nil {
+		m.security = res.Security
+	}
+	m.haveResult = true
+	m.rebuildVisible()
+	m.screen = screenList
+}
+
+// SetInitCmd registers a command for Init to return on the first call.
+// Used by the CLI to launch the background discovery pipeline.
+func (m *Model) SetInitCmd(cmd tea.Cmd) {
+	m.initCmd = cmd
+}
+
+// SetLoadingError records a fatal pipeline failure and switches to the
+// error screen.
+func (m *Model) SetLoadingError(err error) {
+	m.loadingErr = err
+	m.screen = screenError
+}
+
+// rebuildVisible recomputes which dependency indices the list shows,
+// applying the filter pipeline in order:
+//
+//	all deps → security-only filter → search filter →
+//	security-urgency sort → search prefix rank
+//
+// Every stage is stable, so the discovery order survives where no stage
+// has an opinion. The cursor is clamped to the new range.
+func (m *Model) rebuildVisible() {
+	m.visible = m.visible[:0]
+	securityAvailable := m.hasSecurityData()
+	if m.secMode == SecurityOnly && securityAvailable {
+		for i := range m.deps {
+			if !m.security[i].Status.CheckedOK() || len(m.security[i].Status.Vulnerabilities) == 0 {
+				continue
+			}
+			m.visible = append(m.visible, i)
+		}
+	} else {
+		m.visible = m.applySearchFilter(m.visible, m.query)
+	}
+
+	if m.secMode == SecurityOnly && securityAvailable && m.query != "" {
+		filtered := m.applySearchFilter(nil, m.query)
+		// Keep only the search matches within the security-only list,
+		// preserving that list's severity ordering.
+		keep := make(map[int]bool, len(filtered))
+		for _, i := range filtered {
+			keep[i] = true
+		}
+		out := m.visible[:0]
+		for _, i := range m.visible {
+			if keep[i] {
+				out = append(out, i)
+			}
+		}
+		m.visible = out
+	}
+
+	// Security-urgency sorting needs aligned security data; it is absent
+	// when the pipeline skipped the check, so sort only when it exists.
+	if m.hasSecurityData() {
+		sort.SliceStable(m.visible, func(a, b int) bool {
+			return secUrgency(m.security[m.visible[a]]) > secUrgency(m.security[m.visible[b]])
+		})
+	}
+	m.rankBySearch(m.query)
+
+	if m.cursor >= len(m.visible) {
+		m.cursor = max(len(m.visible)-1, 0)
+	}
+	if m.topIndex > m.cursor {
+		m.topIndex = m.cursor
+	}
+	// Guard against an offset past the end of a now-shorter list: the render
+	// loop starts at topIndex, so an out-of-range offset would draw no rows
+	// at all despite there being matches.
+	if m.topIndex >= len(m.visible) {
+		m.topIndex = max(len(m.visible)-1, 0)
+	}
+}
+
+// secUrgency ranks a dependency for list ordering: vulnerable deps by
+// severity, failed checks above clean deps, clean deps last.
+func secUrgency(item security.DependencyStatus) int {
+	switch {
+	case item.Status.CheckedOK() && len(item.Status.Vulnerabilities) > 0:
+		return 10 + item.Status.Severity.Rank()
+	case !item.Status.CheckedOK():
+		return 5
+	default:
+		return 0
+	}
+}
+
+// hasSecurityData reports whether per-dependency security statuses are
+// present and aligned by index with deps. It is false when the check was
+// disabled (--no-security), when the pipeline reported it disabled, or
+// before the result has arrived. Every place that indexes m.security must
+// consult it first.
+func (m *Model) hasSecurityData() bool {
+	return m.secMode != SecurityOff && len(m.deps) > 0 && len(m.security) == len(m.deps)
+}
+
+// securityFor returns the security status for a deps index, or a
+// disabled/unchecked status when security data is absent.
+func (m *Model) securityFor(i int) security.DependencyStatus {
+	if i < 0 || i >= len(m.security) {
+		return security.DependencyStatus{}
+	}
+	return m.security[i]
 }
 
 // Init initializes the model.
 func (m *Model) Init() tea.Cmd {
-	if m.screen == screenLoading {
-		return m.spinner.Tick
+	var cmds []tea.Cmd
+	if m.initCmd != nil {
+		cmds = append(cmds, m.initCmd)
+		m.initCmd = nil // fire once
 	}
-	return nil
+	if m.screen == screenLoading {
+		cmds = append(cmds, m.spinner.Tick)
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // Msg types for tea commands.
@@ -103,17 +282,127 @@ type upgradeProgressMsg struct {
 	progress updater.ProgressUpdate
 }
 
-type upgradeStartedMsg struct{}
-
 // startUpgradeMsg triggers the upgrade process.
 type startUpgradeMsg struct {
 	deps []module.Dependency
 }
 
-// screenResizeMsg handles terminal resize events.
-type screenResizeMsg struct {
-	width  int
-	height int
+// pipelineProgressMsg reports a loading-phase progress snapshot from the
+// background pipeline.
+type pipelineProgressMsg struct {
+	progress pipeline.Progress
+}
+
+// pipelineResultMsg carries the completed discovery/security result.
+type pipelineResultMsg struct {
+	result pipeline.Result
+}
+
+// pipelineErrMsg carries a fatal pipeline failure (whole-run error, not a
+// per-dependency skip).
+type pipelineErrMsg struct {
+	err error
+}
+
+// StartPipeline launches the discovery pipeline in the background and
+// returns the command that starts delivering its events to the UI. The TUI
+// renders the loading screen immediately and stays responsive.
+//
+// A dedicated goroutine multiplexes the pipeline's progress and outcome
+// channels onto one message channel, which the UI drains with
+// waitForPipeline — re-armed after every progress event so the stream is
+// read to completion. The pipeline itself sends exactly one outcome, so the
+// multiplexer stops after forwarding it.
+func (m *Model) StartPipeline(p *pipeline.Pipeline, includeIndirect bool) tea.Cmd {
+	progress := make(chan pipeline.Progress, 16)
+	results := make(chan pipeline.Result, 1)
+	errs := make(chan error, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), pipeline.Deadline)
+	m.cancel = cancel
+
+	go func() {
+		defer close(results)
+		defer close(errs)
+		p.Run(ctx, includeIndirect, m.secMode != SecurityOff, progress, results, errs)
+	}()
+
+	msgs := make(chan tea.Msg, 16)
+	m.pipelineMsgs = msgs
+
+	go func() {
+		defer close(msgs)
+
+		// progress is closed by Run only after it has delivered its single
+		// outcome, and results/errs are closed just after that. Because
+		// several channels can be closed at once, a closed channel is
+		// disabled (set to nil) rather than treated as an outcome — a plain
+		// select over them could otherwise pick a closed errs/results and
+		// exit without ever forwarding the buffered result, stranding the
+		// UI on the loading screen.
+		for progress != nil || results != nil || errs != nil {
+			select {
+			case pr, ok := <-progress:
+				if !ok {
+					progress = nil
+					continue
+				}
+				select {
+				case msgs <- pipelineProgressMsg{progress: pr}:
+				case <-ctx.Done():
+					return
+				}
+
+			case res, ok := <-results:
+				if !ok {
+					results = nil
+					continue
+				}
+				select {
+				case msgs <- pipelineResultMsg{result: res}:
+				case <-ctx.Done():
+				}
+				return
+
+			case err, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
+				select {
+				case msgs <- pipelineErrMsg{err: err}:
+				case <-ctx.Done():
+				}
+				return
+
+			case <-ctx.Done():
+				select {
+				case msgs <- pipelineErrMsg{err: ctx.Err()}:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	return m.waitForPipeline()
+}
+
+// waitForPipeline returns a command that delivers the next pipeline event.
+// It is re-armed after each progress message (see Update) and a nil message
+// is returned once the stream is closed.
+func (m *Model) waitForPipeline() tea.Cmd {
+	msgs := m.pipelineMsgs
+	if msgs == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		msg, ok := <-msgs
+		if !ok {
+			return nil
+		}
+		return msg
+	}
 }
 
 // Update handles all message types and state transitions.
@@ -132,6 +421,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeyMsg(msg)
 
 	case spinner.TickMsg:
+		// Keep the spinner animating on the loading screen.
 		if m.screen == screenLoading {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
@@ -139,14 +429,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case pipelineProgressMsg:
+		m.loadingStage = msg.progress.Stage
+		m.loadingMod = msg.progress.Module
+		m.loadingDone = msg.progress.Done
+		m.loadingTotal = msg.progress.Total
+		// Re-arm the reader: the pipeline sends many progress events before
+		// its single result, so stopping here would strand the run on the
+		// loading screen.
+		return m, m.waitForPipeline()
+
+	case pipelineResultMsg:
+		m.ApplyResult(msg.result)
+		return m, nil
+
+	case pipelineErrMsg:
+		m.SetLoadingError(msg.err)
+		return m, nil
+
 	case startUpgradeMsg:
 		return m.startUpgrade(msg.deps)
 
 	case upgradeProgressMsg:
 		return m.handleUpgradeProgress(msg.progress)
-
-	case upgradeStartedMsg:
-		return m, nil
 	}
 
 	return m, tea.Batch(cmds...)
@@ -155,8 +460,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKeyMsg processes keyboard input based on the current screen.
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.screen {
+	case screenLoading:
+		// Allow quitting while loading; everything else is ignored so the
+		// phase completes undisturbed.
+		switch msg.String() {
+		case "q", "esc", "ctrl+c":
+			if m.cancel != nil {
+				m.cancel()
+			}
+			return m, tea.Quit
+		}
+		return m, nil
 	case screenList:
 		return m.handleListKey(msg)
+	case screenSkipped:
+		return m.handleSkippedKey(msg)
+	case screenDetail:
+		return m.handleDetailKey(msg)
 	case screenConfirm:
 		return m.handleConfirmKey(msg)
 	case screenDone, screenError:
@@ -168,10 +488,48 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleListKey processes keyboard input on the list screen.
-func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// handleSkippedKey processes input on the skipped-dependencies screen.
+func (m *Model) handleSkippedKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "q", "esc":
+	case "q", "esc", "s", "enter", "ctrl+c":
+		m.screen = screenList
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleDetailKey processes input on the security detail screen.
+func (m *Model) handleDetailKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc", "d", "enter", "ctrl+c":
+		m.screen = screenList
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleListKey processes keyboard input on the list screen. While the
+// search input has focus, all keys are handled by handleSearchKey instead.
+func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searching {
+		return m.handleSearchKey(msg)
+	}
+
+	switch msg.String() {
+	case "/":
+		m.enterSearch()
+		return m, nil
+
+	case "q":
+		return m, tea.Quit
+
+	case "esc":
+		// Esc with an active (kept) filter clears it; with no filter it
+		// quits as before.
+		if m.query != "" {
+			m.setQuery("")
+			return m, nil
+		}
 		return m, tea.Quit
 
 	case "up", "k":
@@ -181,7 +539,7 @@ func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "down", "j":
-		if m.cursor < len(m.deps)-1 {
+		if m.cursor < len(m.visible)-1 {
 			m.cursor++
 			m.ensureCursorVisible()
 		}
@@ -194,6 +552,19 @@ func (m *Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n":
 		m.selectNone()
+
+	case "d":
+		// Security details only exist when the check ran and its statuses
+		// are aligned with the dependency list.
+		if len(m.visible) > 0 && m.hasSecurityData() {
+			m.detailIndex = m.visible[m.cursor]
+			m.screen = screenDetail
+		}
+
+	case "s":
+		if len(m.skipped) > 0 {
+			m.screen = screenSkipped
+		}
 
 	case "enter":
 		return m.handleEnter()
@@ -252,19 +623,23 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// toggleSelection toggles the selection state of the dependency at index i.
+// toggleSelection toggles the selection state of the visible row at index i.
 func (m *Model) toggleSelection(i int) {
-	if m.selected[i] {
-		delete(m.selected, i)
+	if i < 0 || i >= len(m.visible) {
+		return
+	}
+	depIdx := m.visible[i]
+	if m.selected[depIdx] {
+		delete(m.selected, depIdx)
 	} else {
-		m.selected[i] = true
+		m.selected[depIdx] = true
 	}
 }
 
 // selectAll selects all currently displayed dependencies.
 func (m *Model) selectAll() {
-	for i := range m.deps {
-		m.selected[i] = true
+	for _, depIdx := range m.visible {
+		m.selected[depIdx] = true
 	}
 }
 
@@ -353,6 +728,10 @@ func (m *Model) View() string {
 		return m.loadingView()
 	case screenList:
 		return m.listView()
+	case screenSkipped:
+		return m.skippedView()
+	case screenDetail:
+		return m.detailView()
 	case screenConfirm:
 		return m.confirmView()
 	case screenUpgrading:
@@ -365,9 +744,57 @@ func (m *Model) View() string {
 	return ""
 }
 
-// loadingView shows a spinner while checking dependencies.
+// loadingView shows the spinner, the current operation, and progress so
+// the user always knows whether goup is working, waiting, or finished.
 func (m *Model) loadingView() string {
-	return fmt.Sprintf("\n  %s Checking dependencies...\n", m.spinner.View())
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("\n  goup — Go dependency updater"))
+	b.WriteString("\n\n")
+
+	b.WriteString(fmt.Sprintf("  %s %s\n", m.spinner.View(), infoStyle.Render(m.loadingStage.String())))
+
+	// Detail line: the module being checked, plus numeric progress when
+	// the total is known.
+	if m.loadingMod != "" {
+		b.WriteString(fmt.Sprintf("  %s Checking %s\n",
+			dimmedStyle.Render("·"), m.loadingMod))
+	}
+	if m.loadingTotal > 0 {
+		b.WriteString(fmt.Sprintf("  %s %d of %d\n",
+			dimmedStyle.Render("·"), m.loadingDone, m.loadingTotal))
+	}
+
+	b.WriteString(fmt.Sprintf("\n  %s\n", dimmedStyle.Render("q Cancel")))
+	return appStyle.Render(b.String())
+}
+
+// skippedView lists modules that could not be processed during discovery.
+// It never blocks the main workflow: the list screen stays fully usable.
+func (m *Model) skippedView() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render("\n  Skipped dependencies"))
+	b.WriteString("\n\n")
+
+	if len(m.skipped) == 0 {
+		b.WriteString(successStyle.Render("  ✓ Nothing was skipped") + "\n")
+	}
+
+	for _, s := range m.skipped {
+		b.WriteString(fmt.Sprintf("  %s %s\n", warningStyle.Render("⚠"), s.Path))
+		reason := "unknown reason"
+		if s.Reason != nil {
+			reason = s.Reason.Error()
+		}
+		b.WriteString(fmt.Sprintf("    %s %s\n", dimmedStyle.Render("reason:"), dimmedStyle.Render(reason)))
+	}
+
+	b.WriteString(fmt.Sprintf("\n  %s  %s\n",
+		infoStyle.Render("Esc/s"),
+		dimmedStyle.Render("Back"),
+	))
+	return appStyle.Render(b.String())
 }
 
 // listView renders the main dependency list.
@@ -378,14 +805,100 @@ func (m *Model) listView() string {
 	b.WriteString(titleStyle.Render("\n  goup — Go dependency updater"))
 	b.WriteString("\n\n")
 
-	// Subtitle.
-	updatesCount := len(m.deps)
-	b.WriteString(subtitleStyle.Render(fmt.Sprintf("  %d updates available", updatesCount)))
-	b.WriteString("\n\n")
+	// Search input line while search mode is active.
+	if m.searching {
+		b.WriteString(fmt.Sprintf("  %s %s█\n",
+			infoStyle.Render("Search:"),
+			m.query))
+		b.WriteString("\n")
+	} else if m.query != "" {
+		// A kept filter from a previous search (Enter exits search mode
+		// without clearing).
+		b.WriteString(fmt.Sprintf("  %s %s  %s\n",
+			dimmedStyle.Render("Filter:"),
+			m.query,
+			dimmedStyle.Render(fmt.Sprintf("(%d match%s)", len(m.visible), plural(len(m.visible))))))
+	}
 
-	// Column headers.
-	columns := fmt.Sprintf("  %-45s %-12s %-12s %s",
-		"Dependency", "Current", "Latest", "Type")
+	// Subtitle and security summary.
+	updatesCount := len(m.visible)
+	if !m.searchActive() {
+		label := fmt.Sprintf("%d updates available", updatesCount)
+		if m.secMode == SecurityOnly {
+			label = fmt.Sprintf("%d vulnerable %s", updatesCount, pluralWord(updatesCount, "dependency", "dependencies"))
+		}
+		b.WriteString(subtitleStyle.Render("  " + label))
+		b.WriteString("\n")
+	}
+	switch {
+	case m.secMode == SecurityOff:
+		b.WriteString(dimmedStyle.Render("  security check disabled (--no-security)") + "\n")
+	case m.hasSecurityData():
+		if summary := Summarize(m.security); summary.HasIssues() {
+			b.WriteString("  " + summary.Render() + "\n")
+		}
+	}
+	b.WriteString("\n")
+
+	// Empty result state: no matches at all.
+	if len(m.visible) == 0 {
+		// A skipped count is surfaced in every empty state so absence is
+		// never mistaken for a clean result.
+		writeSkipped := func() {
+			if n := len(m.skipped); n > 0 {
+				b.WriteString(fmt.Sprintf("  %s %d dependencies skipped (%s for details)\n",
+					warningStyle.Render("⚠"), n, infoStyle.Render("s")))
+			}
+		}
+
+		switch {
+		case m.searchActive():
+			// A search or kept filter matched nothing.
+			b.WriteString(dimmedStyle.Render("  No dependencies found.") + "\n\n")
+			b.WriteString(fmt.Sprintf("  %s %s\n",
+				infoStyle.Render("Esc"),
+				dimmedStyle.Render("Clear search")))
+		case m.secMode == SecurityOnly && m.haveResult:
+			// --security with an empty list. A clean result can only be
+			// claimed when every check actually completed: dependencies whose
+			// check failed are filtered out of this view, so "nothing shown"
+			// must not be read as "nothing vulnerable" when the database was
+			// unreachable.
+			summary := Summarize(m.security)
+			switch {
+			case summary.FailedChecks > 0:
+				b.WriteString(warningStyle.Render(fmt.Sprintf(
+					"  ⚠ No confirmed vulnerabilities, but %d %s could not be checked.",
+					summary.FailedChecks,
+					pluralWord(summary.FailedChecks, "dependency", "dependencies"))) + "\n")
+				b.WriteString(dimmedStyle.Render(
+					"    Run without --security to see every dependency and the failures.") + "\n")
+			default:
+				b.WriteString(successStyle.Render("  ✓ No vulnerable dependencies among the available updates.") + "\n")
+			}
+			writeSkipped()
+		case m.haveResult:
+			// Nothing filtered, so everything is already current.
+			b.WriteString(successStyle.Render("  ✓ All dependencies are up to date.") + "\n")
+			writeSkipped()
+		default:
+			b.WriteString(dimmedStyle.Render("  No dependencies found.") + "\n")
+		}
+		return appStyle.Render(b.String())
+	}
+
+	// Column headers, aligned with renderItem's cells: the dependency
+	// column accounts for the two-cell checkbox prefix, and an empty cell
+	// stands in for the version arrow.
+	columns := fmt.Sprintf("  %s %s %s %s %s",
+		padRight("Dependency", depColumnWidth+2),
+		padRight("Current", versionColumnWidth),
+		" ",
+		padRight("Latest", versionColumnWidth),
+		padRight("Type", depTypeColumnWidth))
+	if m.hasSecurityData() {
+		columns += "  Security"
+	}
 	b.WriteString(dimmedStyle.Render(columns))
 	b.WriteString("\n")
 	b.WriteString(dimmedStyle.Render(strings.Repeat("─", max(m.width-4, 50))))
@@ -397,44 +910,64 @@ func (m *Model) listView() string {
 		visibleHeight = 10
 	}
 	end := m.topIndex + visibleHeight
-	if end > len(m.deps) {
-		end = len(m.deps)
+	if end > len(m.visible) {
+		end = len(m.visible)
 	}
 
-	for i := m.topIndex; i < end; i++ {
-		dep := m.deps[i]
-		selected := m.selected[i]
-		isCursor := i == m.cursor
+	for row := m.topIndex; row < end; row++ {
+		depIdx := m.visible[row]
+		dep := m.deps[depIdx]
+		selected := m.selected[depIdx]
+		isCursor := row == m.cursor
 
-		b.WriteString(m.renderItem(dep, selected, isCursor))
+		b.WriteString(m.renderItem(depIdx, dep, selected, isCursor))
 		b.WriteString("\n")
 	}
 
 	// Footer.
 	b.WriteString("\n")
 
+	// Match count while searching, subtle and non-intrusive.
+	if m.searching {
+		b.WriteString(fmt.Sprintf("  %s\n",
+			dimmedStyle.Render(fmt.Sprintf("%d of %d dependencies match",
+				len(m.visible), len(m.deps)))))
+	}
+
 	// Selection count.
 	selectedCount := len(m.selectedIndices())
-	if selectedCount > 0 {
-		b.WriteString(fmt.Sprintf("  %s %d selected\n", infoStyle.Render("●"), selectedCount))
-	} else {
+	switch {
+	case selectedCount == 0:
 		b.WriteString(fmt.Sprintf("  %s no dependencies selected\n", dimmedStyle.Render("○")))
+	case m.secMode == SecurityOnly:
+		b.WriteString(fmt.Sprintf("  %s %d selected (%s)\n",
+			infoStyle.Render("●"), selectedCount,
+			dimmedStyle.Render("vulnerable dependencies")))
+	default:
+		b.WriteString(fmt.Sprintf("  %s %d selected\n", infoStyle.Render("●"), selectedCount))
+	}
+
+	// Skipped-dependency count so absence is never mistaken for a clean
+	// result. "s" opens the detail list.
+	if n := len(m.skipped); n > 0 {
+		b.WriteString(fmt.Sprintf("  %s %d dependencies skipped (%s for details)\n",
+			warningStyle.Render("⚠"), n, infoStyle.Render("s")))
 	}
 
 	// Help bar.
 	b.WriteString("\n")
 	b.WriteString(m.renderHelp())
 
-	if m.topIndex > 0 || end < len(m.deps) {
+	if m.topIndex > 0 || end < len(m.visible) {
 		b.WriteString(fmt.Sprintf("\n  %s", dimmedStyle.Render(fmt.Sprintf(
-			"Showing %d-%d of %d", m.topIndex+1, end, len(m.deps)))))
+			"Showing %d-%d of %d", m.topIndex+1, end, len(m.visible)))))
 	}
 
 	return appStyle.Render(b.String())
 }
 
 // renderItem renders a single dependency line.
-func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) string {
+func (m *Model) renderItem(depIdx int, dep module.Dependency, selected bool, isCursor bool) string {
 	// Checkbox.
 	checkbox := checkboxEmpty
 	if selected {
@@ -449,18 +982,27 @@ func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) 
 		depTypeStyle = mutedStyle
 	}
 
-	// Version info.
-	currentVer := dep.CurrentVersion
-	latestVer := dep.LatestVersion
+	// Security column. Rendered only when statuses are present, matching the
+	// header, so the columns can never disagree about its presence.
+	secCol := ""
+	if m.hasSecurityData() {
+		item := m.securityFor(depIdx)
+		secCol = "  " + securityColumn(item)
+		if note := fixNote(item); note != "" {
+			secCol += "  " + note
+		}
+	}
 
-	// Build the line.
-	line := fmt.Sprintf("  %s %-42s %-12s %s %-12s %s",
+	// Build the line. Columns are padded by display width, not byte count,
+	// so long or non-ASCII module paths cannot shift the columns after them.
+	line := fmt.Sprintf("  %s %s %s %s %s %s%s",
 		checkbox,
-		dep.Path,
-		currentVer,
+		padRight(dep.Path, depColumnWidth),
+		padRight(dep.CurrentVersion, versionColumnWidth),
 		versionArrow,
-		latestVer,
-		depTypeStyle.Render(depType),
+		padRight(dep.LatestVersion, versionColumnWidth),
+		depTypeStyle.Render(padRight(depType, depTypeColumnWidth)),
+		secCol,
 	)
 
 	style := itemStyle
@@ -475,10 +1017,51 @@ func (m *Model) renderItem(dep module.Dependency, selected bool, isCursor bool) 
 	return style.Render(line)
 }
 
-// renderHelp shows the keyboard shortcuts.
+// Column widths for the dependency list, measured in display cells.
+const (
+	depColumnWidth     = 42
+	versionColumnWidth = 12
+	depTypeColumnWidth = 8 // widest label is "indirect"
+)
+
+// padRight pads s with spaces to width display cells. It measures with
+// lipgloss.Width so multi-byte and wide characters do not over-pad; strings
+// already at or beyond width are returned unchanged, and one trailing space
+// always separates a long value from the next column.
+func padRight(s string, width int) string {
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s + " "
+}
+
+// renderHelp shows the keyboard shortcuts. Bindings adapt to mode:
+// security-related keys are hidden when disabled, and search mode swaps
+// the footer for its own control hints.
 func (m *Model) renderHelp() string {
+	if m.searching {
+		return strings.Join([]string{
+			fmt.Sprintf("%s %s", infoStyle.Render("Type"), dimmedStyle.Render("Search")),
+			fmt.Sprintf("%s %s", infoStyle.Render("↑/↓"), dimmedStyle.Render("Navigate")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Space"), dimmedStyle.Render("Select")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Enter"), dimmedStyle.Render("Apply")),
+			fmt.Sprintf("%s %s", infoStyle.Render("Esc"), dimmedStyle.Render("Clear")),
+		}, "  ")
+	}
+
 	k := keyMap{}
 	bindings := k.help()
+	// Hide the security-details hint whenever there is no security data to
+	// show (--no-security, or a pipeline that reported the check disabled).
+	if !m.hasSecurityData() {
+		filtered := bindings[:0]
+		for _, b := range bindings {
+			if b.key != "d" {
+				filtered = append(filtered, b)
+			}
+		}
+		bindings = filtered
+	}
 	var parts []string
 	for _, b := range bindings {
 		parts = append(parts, fmt.Sprintf("%s %s",
@@ -486,6 +1069,22 @@ func (m *Model) renderHelp() string {
 			dimmedStyle.Render(b.desc)))
 	}
 	return strings.Join(parts, "  ")
+}
+
+// plural returns "" for 1 and "s" otherwise, for match counts.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "es"
+}
+
+// pluralWord picks the singular or plural word for a count.
+func pluralWord(n int, singular, pluralForm string) string {
+	if n == 1 {
+		return singular
+	}
+	return pluralForm
 }
 
 // confirmView shows the confirmation screen.
@@ -655,15 +1254,4 @@ func (m *Model) errorView() string {
 		dimmedStyle.Render("Quit"),
 	))
 	return appStyle.Render(b.String())
-}
-
-// SetLoadingErr sets an error and switches to the error screen.
-func (m *Model) SetLoadingErr(err error) {
-	m.loadingErr = err
-	m.screen = screenError
-}
-
-// HasSelection returns true if any dependencies are selected.
-func (m *Model) HasSelection() bool {
-	return len(m.selectedIndices()) > 0
 }

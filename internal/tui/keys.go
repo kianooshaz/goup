@@ -10,6 +10,9 @@ func (k keyMap) help() []keyBinding {
 		{key: "Space", desc: "Select"},
 		{key: "a", desc: "All"},
 		{key: "n", desc: "None"},
+		{key: "/", desc: "Search"},
+		{key: "d", desc: "Security details"},
+		{key: "s", desc: "Skipped"},
 		{key: "Enter", desc: "Upgrade"},
 		{key: "q/Esc", desc: "Quit"},
 	}
@@ -19,6 +22,3 @@ type keyBinding struct {
 	key  string
 	desc string
 }
-
-// Matches returns true if the tea.KeyMsg matches this binding.
-// We handle this in the model's Update rather than here.

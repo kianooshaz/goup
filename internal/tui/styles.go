@@ -17,11 +17,6 @@ var (
 	subtitleStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888"))
 
-	headerStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderBottom(true).
-			Padding(0, 1)
-
 	// List item styles.
 	itemStyle = lipgloss.NewStyle().
 			Padding(0, 2, 0, 0)
@@ -33,13 +28,6 @@ var (
 	cursorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(lipgloss.Color("#333333"))
-
-	// Status / footer styles.
-	footerStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderTop(true).
-			Padding(0, 1).
-			Foreground(lipgloss.Color("#888888"))
 
 	// Success / error styles.
 	successStyle = lipgloss.NewStyle().

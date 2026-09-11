@@ -1,16 +1,19 @@
 package module
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
 
 func TestParseGoListOutput(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		want    []GoListModule
-		wantErr bool
+		name  string
+		input string
+		want  []GoListModule
+		// wantSkipped is the number of skip records a malformed record
+		// produces; the parser records the problem instead of failing.
+		wantSkipped int
 	}{
 		{
 			name: "single module with update",
@@ -41,7 +44,7 @@ func TestParseGoListOutput(t *testing.T) {
 					Version:  "v1.0.0",
 					Indirect: false,
 					Main:     false,
-					Update:   &struct {
+					Update: &struct {
 						Path    string `json:"path"`
 						Version string `json:"version"`
 					}{Path: "github.com/foo/bar", Version: "v1.2.0"},
@@ -77,22 +80,33 @@ func TestParseGoListOutput(t *testing.T) {
 			},
 		},
 		{
-			name:    "empty input",
-			input:   ``,
-			want:    nil,
-			wantErr: false,
+			name:        "empty input",
+			input:       ``,
+			want:        nil,
+			wantSkipped: 0,
+		},
+		{
+			// A malformed record must not abort the parse: earlier modules
+			// survive and the damage is reported as a skip.
+			name: "malformed record after a good one",
+			input: `{"path":"github.com/foo/bar","version":"v1.0.0"}
+{not json`,
+			want: []GoListModule{
+				{Path: "github.com/foo/bar", Version: "v1.0.0"},
+			},
+			wantSkipped: 1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseGoListOutput([]byte(tt.input))
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parseGoListOutput() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+			got, skipped := parseGoListOutput([]byte(tt.input))
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("parseGoListOutput() = %+v, want %+v", got, tt.want)
+			}
+			if len(skipped) != tt.wantSkipped {
+				t.Errorf("parseGoListOutput() skipped %d records, want %d: %+v",
+					len(skipped), tt.wantSkipped, skipped)
 			}
 		})
 	}
@@ -104,6 +118,7 @@ func TestConvertToDependencies(t *testing.T) {
 		modules         []GoListModule
 		includeIndirect bool
 		want            []Dependency
+		wantSkipped     []SkippedDependency
 	}{
 		{
 			name: "direct only, exclude indirect",
@@ -210,13 +225,64 @@ func TestConvertToDependencies(t *testing.T) {
 			includeIndirect: false,
 			want:            nil,
 		},
+		{
+			// A module go could not load (reported because of -e) becomes a
+			// skip record carrying go's own message, while healthy modules
+			// are still converted.
+			name: "load error becomes a skip",
+			modules: []GoListModule{
+				{
+					Path:     "github.com/foo/broken",
+					Version:  "v1.0.0",
+					Indirect: false,
+					Main:     false,
+					Error: &struct {
+						Err string `json:"Err"`
+					}{Err: "cannot find module providing package"},
+				},
+				{
+					Path:     "github.com/foo/ok",
+					Version:  "v1.0.0",
+					Indirect: false,
+					Main:     false,
+					Update: &struct {
+						Path    string `json:"path"`
+						Version string `json:"version"`
+					}{Path: "github.com/foo/ok", Version: "v1.1.0"},
+				},
+			},
+			includeIndirect: false,
+			want: []Dependency{
+				{
+					Path:           "github.com/foo/ok",
+					CurrentVersion: "v1.0.0",
+					LatestVersion:  "v1.1.0",
+					Indirect:       false,
+					UpdateType:     UpdateMinor,
+				},
+			},
+			wantSkipped: []SkippedDependency{
+				{Path: "github.com/foo/broken", Reason: errors.New("cannot find module providing package")},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := convertToDependencies(tt.modules, tt.includeIndirect)
+			got, skipped := convertToDependencies(tt.modules, tt.includeIndirect)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("convertToDependencies() = %+v, want %+v", got, tt.want)
+			}
+			if len(skipped) != len(tt.wantSkipped) {
+				t.Fatalf("skipped = %+v, want %+v", skipped, tt.wantSkipped)
+			}
+			for i, want := range tt.wantSkipped {
+				if skipped[i].Path != want.Path {
+					t.Errorf("skipped[%d].Path = %q, want %q", i, skipped[i].Path, want.Path)
+				}
+				if skipped[i].Reason == nil || skipped[i].Reason.Error() != want.Reason.Error() {
+					t.Errorf("skipped[%d].Reason = %v, want %v", i, skipped[i].Reason, want.Reason)
+				}
 			}
 		})
 	}

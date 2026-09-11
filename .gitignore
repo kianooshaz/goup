@@ -24,6 +24,12 @@ profile.cov
 go.work
 go.work.sum
 
+# Build artifacts from the Makefile
+bin/
+
+# The example module's compiled binary (produced by `go build ./...` there)
+/example/example
+
 # env file
 .env
 
